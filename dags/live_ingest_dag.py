@@ -30,7 +30,7 @@ def _archive(source: str, blob: bytes, ext: str) -> str:
 
 def t_pull_afad() -> int:
     end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=60)
+    start = end - timedelta(hours=24)
     res = sources.fetch_afad(start, end, min_mag=1.0)
     uri = _archive("AFAD", res.raw_bytes, res.raw_ext)
     n = db.upsert_raw("AFAD", res.records, archive_uri=uri)
@@ -40,11 +40,12 @@ def t_pull_afad() -> int:
 
 def t_pull_emsc() -> int:
     end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=1)
-    res = sources.fetch_emsc(start, end, min_mag=1.5)
+    start = end - timedelta(hours=24)
+    res = sources.fetch_emsc(start, end, min_mag=0.0)
     uri = _archive("EMSC", res.raw_bytes, res.raw_ext)
     n = db.upsert_raw("EMSC", res.records, archive_uri=uri)
     log.info("EMSC live: %d records", n)
+    log.info(res.records)
     return n
 
 

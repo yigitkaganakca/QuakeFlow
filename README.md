@@ -43,7 +43,7 @@ Within ~5 minutes of `git clone`, an evaluator's machine has:
   script creates and enables via REST,
 * a **defence-in-depth** Airflow `live_ingest` DAG that runs every
   5 minutes, archives raw responses to MinIO via `boto3`, and writes
-  to the same `raw.*_events` tables with `ON CONFLICT DO NOTHING`,
+  to the same `raw.*_events` tables with updating just the archive uri,
   so either NiFi or Airflow alone keeps the tables fresh,
 * every raw response archived immutably in **MinIO** so it can be
   replayed without re-hitting the agency,
@@ -189,9 +189,13 @@ docker compose down -v         # also removes volumes (clean reset)
    sole writer to the immutable **MinIO** archive (via `boto3`,
    because NiFi 1.x's `PutS3Object` has a known incompatibility
    with MinIO that path-style addressing does not fix). It also
-   upserts each fetched response into `raw.*` with
-   `ON CONFLICT (event_id) DO NOTHING`, so it works as a
-   defence-in-depth backup to NiFi for the JSON sources and as the
+   upserts each fetched response into `raw.*` using
+   `ON CONFLICT (event_id) DO UPDATE SET archive_uri =
+   COALESCE(<existing>, EXCLUDED.archive_uri)`, so any NiFi row
+   that landed first with a NULL `archive_uri` gets its audit
+   handle backfilled on the next live_ingest tick (existing
+   non-NULL URIs are never overwritten). This makes `live_ingest`
+   a defence-in-depth backup to NiFi for the JSON sources and the
    sole writer for KOERI.
 3. **Airflow `harmonize`** DAG reads new raw rows (per-source watermark
    on `received_at`) and projects them into `harmonized.events` using
@@ -314,12 +318,12 @@ docker compose exec postgres psql -U quake -d quakes \
 
 | Concern              | Mechanism                                                     |
 |----------------------|---------------------------------------------------------------|
-| Idempotent ingestion | `ON CONFLICT (event_id) DO NOTHING` on raw, UPSERT on harmonized and mart |
+| Idempotent ingestion | NiFi PutSQL: `ON CONFLICT (event_id) DO NOTHING`. Python `live_ingest` / backfill: `ON CONFLICT DO UPDATE SET archive_uri = COALESCE(<existing>, EXCLUDED.archive_uri)` so dual writers reconcile the audit handle without overwriting it. UPSERT on harmonized and mart. |
 | Idempotent dedup     | `event_uid` is a deterministic hash of the cluster centroid   |
 | Retries              | NiFi penalize+retry; Airflow `retries=2..3, retry_delay=30s`  |
 | Failure isolation    | Each DAG task is a separate process; one task failing doesn't block siblings |
 | Replay               | Every raw response archived immutably in MinIO; `BACKFILL_MODE=replay` re-parses without API calls |
-| Defence in depth     | NiFi (`PutSQL`, 60 s) and Airflow `live_ingest` (`psycopg`, 5 min) both write into the same `raw.*` tables for AFAD/EMSC/USGS with `ON CONFLICT DO NOTHING`; either alone keeps the JSON tables fresh. KOERI is `live_ingest`-only because its HTML response is best parsed in Python. MinIO writes are exclusively done by `live_ingest` and the backfill container via `boto3`. |
+| Defence in depth     | NiFi (`PutSQL`, 60 s) and Airflow `live_ingest` (`psycopg`, 5 min) both write into the same `raw.*` tables for AFAD/EMSC/USGS. NiFi inserts with a NULL `archive_uri` (it can't write to MinIO); `live_ingest` writes the MinIO object first and then upserts with the URI, which backfills any pre-existing NiFi NULL via `COALESCE`. Either writer alone keeps the JSON tables fresh; KOERI is `live_ingest`-only because its HTML response is best parsed in Python. |
 | Data quality         | `quality_check_dag` asserts source freshness, harmonized integrity, agreement-level histogram |
 | Observability        | Airflow UI per-task logs, structured Python logging, pgAdmin / MinIO consoles, Kibana dashboard |
 | Secrets              | `.env` (gitignored), every credential interpolated, none hardcoded |
