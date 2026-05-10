@@ -1,0 +1,59 @@
+{
+  "_comment": "we created this reference description of the QuakeFlow NiFi process group. Actual canvas is built by /opt/quakeflow/install_flow.py at container startup. But if somehow it doesnt look the same in other computers this file documents the intended shape so you can check and verify it matches.",
+  "process_group": "QuakeFlow",
+  "controller_services": [
+    {
+      "name":  "quake-pg",
+      "type":  "org.apache.nifi.dbcp.DBCPConnectionPool",
+      "properties": {
+        "Database Connection URL":  "jdbc:postgresql://postgres:5432/quakes",
+        "Database Driver Class Name": "org.postgresql.Driver",
+        "Database Driver Locations":  "/opt/nifi/nifi-current/lib/postgresql.jar",
+        "Database User":              "${QUAKE_PG_USER}",
+        "Password":                   "${QUAKE_PG_PASSWORD}"
+      }
+    }
+  ],
+  "chains": [
+    {
+      "source": "AFAD",
+      "schedule": "60 sec",
+      "url":    "https://deprem.afad.gov.tr/apiv2/event/filter?last=20",
+      "format": "json",
+      "raw_table": "raw.afad_events",
+      "id_jsonpath": "$.eventID",
+      "split_jsonpath": "$.[*]"
+    },
+    {
+      "source": "EMSC",
+      "schedule": "60 sec",
+      "url":    "https://www.seismicportal.eu/fdsnws/event/1/query?format=json&minlatitude=35.5&maxlatitude=42.5&minlongitude=25.5&maxlongitude=45.0&limit=50",
+      "format": "json",
+      "raw_table": "raw.emsc_events",
+      "id_jsonpath": "$.id",
+      "split_jsonpath": "$.features[*]"
+    },
+    {
+      "source": "USGS",
+      "schedule": "300 sec",
+      "url":    "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&minlatitude=35.5&maxlatitude=42.5&minlongitude=25.5&maxlongitude=45.0&minmagnitude=2.5&limit=50",
+      "format": "json",
+      "raw_table": "raw.usgs_events",
+      "id_jsonpath": "$.id",
+      "split_jsonpath": "$.features[*]"
+    },
+    {
+      "source": "KOERI",
+      "schedule": "60 sec",
+      "url":    "http://www.koeri.boun.edu.tr/scripts/lst0.asp",
+      "format": "html",
+      "raw_table": "raw.koeri_events",
+      "note": "HTML fixed-width table; we archive the raw HTML to MinIO and let the harmonize DAG parse it (so backfill, replay and live mode all share one parser)."
+    }
+  ],
+  "common": {
+    "archive_bucket":  "quake-raw",
+    "archive_key_pattern": "{source}/{yyyy-MM-dd}/{HHmmss}-{uuid}.{ext}",
+    "object_store_endpoint": "http://minio:9000"
+  }
+}

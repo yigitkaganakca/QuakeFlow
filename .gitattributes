@@ -1,0 +1,8 @@
+# Keep shell scripts and YAML/JSON with LF line endings even when checked
+# out on Windows; otherwise the Docker images that use them as entrypoints
+# fail with `exec /entrypoint.sh: no such file or directory`.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.ndjson    text eol=lf

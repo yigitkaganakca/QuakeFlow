@@ -1,0 +1,53 @@
+# Environment / secrets
+.env
+.env.local
+*.secret
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.bbl
+*.blg
+docs/report/_minted-*
+
+# Local data dumps (we ship a small sample under data/sample/)
+data/dumps/
+data/cache/
+*.dump
+
+# Demo recordings (large; track outside git)
+docs/demo/*.mp4
+docs/demo/*.mov
+
+# Docker / build leftovers
+*.pid
+nifi/state/
+nifi/work/
+
+# Plan / agent artifacts
+.cursor/

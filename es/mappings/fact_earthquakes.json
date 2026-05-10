@@ -1,0 +1,30 @@
+{
+  "settings": {
+    "number_of_shards":   1,
+    "number_of_replicas": 0,
+    "refresh_interval":   "5s"
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "event_uid":        { "type": "keyword" },
+      "event_time":       { "type": "date"    },
+      "location":         { "type": "geo_point" },
+      "latitude":         { "type": "float"   },
+      "longitude":        { "type": "float"   },
+      "depth_km":         { "type": "half_float" },
+      "magnitude":        { "type": "half_float" },
+      "mag_type":         { "type": "keyword" },
+      "place":            {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+      },
+      "province":         { "type": "keyword" },
+      "district":         { "type": "keyword" },
+      "preferred_source": { "type": "keyword" },
+      "agreement_level":  { "type": "byte"    },
+      "sources":          { "type": "keyword" },
+      "source_values":    { "type": "object", "enabled": false }
+    }
+  }
+}

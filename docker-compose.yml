@@ -1,0 +1,395 @@
+# this is our single docker compose file that runs the entire pipeline with code:
+#   docker compose up --build
+#
+# Layers (left -> right in the architecture diagram) in the report u can see is that:
+#   Sources           : AFAD, KOERI, EMSC, USGS (external)
+#   Ingestion         : nifi (live)         + backfill (historical / replay)
+#   Object archive    : minio (s3-compatible) - immutable raw payloads
+#   Operational store : postgres (raw / harmonized / mart schemas) + pgadmin
+#   Orchestration     : airflow (scheduler + webserver) on its own metadata pg
+#   Search            : elasticsearch + es-init (mapping)
+#   Visualization     : kibana + kibana-init (dashboards import)
+#
+# Different profiles u can choose on:
+#   default       -> infra + nifi + airflow (live mode)
+#   backfill      -> add the one-shot historical / replay container
+#   tests         -> add the pytest container
+# =============================================================================
+
+name: quakeflow
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_PG_USER}:${AIRFLOW_PG_PASSWORD}@postgres-airflow:5432/${AIRFLOW_PG_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+    # Project-specific - DAGs read these to talk to other services on quakenet which is the network we connect them on docker.
+    QUAKE_PG_HOST: postgres
+    QUAKE_PG_PORT: "5432"
+    QUAKE_PG_USER: ${POSTGRES_USER}
+    QUAKE_PG_PASSWORD: ${POSTGRES_PASSWORD}
+    QUAKE_PG_DB: ${POSTGRES_DB}
+    QUAKE_ES_URL: http://elasticsearch:9200
+    QUAKE_ES_INDEX: quakes
+    QUAKE_MINIO_ENDPOINT: http://minio:9000
+    QUAKE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+    QUAKE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    QUAKE_MINIO_BUCKET: ${MINIO_BUCKET}
+    PYTHONPATH: /opt/airflow/dags:/opt/airflow/src
+  user: "${AIRFLOW_UID:-50000}:0"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  networks:
+    - quakenet
+
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: quake-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [quakenet]
+
+  pgadmin:
+    image: dpage/pgadmin4:8.14
+    container_name: quake-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "${PGADMIN_PORT}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [quakenet]
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: quake-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS}
+      cluster.name: quakeflow
+    ports:
+      - "${ES_PORT}:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -E 'green|yellow' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [quakenet]
+  es-init:
+    build:
+      context: .
+      dockerfile: docker/es-init/Dockerfile
+    container_name: quake-es-init
+    environment:
+      ES_URL: http://elasticsearch:9200
+      ES_INDEX: quakes
+    volumes:
+      - ./es/mappings:/mappings:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+    networks: [quakenet]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: quake-kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_PUBLICBASEURL: http://localhost:${KIBANA_PORT}
+    ports:
+      - "${KIBANA_PORT}:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      es-init:
+        condition: service_completed_successfully
+    networks: [quakenet]
+
+  kibana-init:
+    build:
+      context: .
+      dockerfile: docker/kibana-init/Dockerfile
+    container_name: quake-kibana-init
+    environment:
+      KIBANA_URL: http://kibana:5601
+    volumes:
+      - ./es/kibana/exports:/exports:ro
+    depends_on:
+      kibana:
+        condition: service_started
+    restart: "no"
+    networks: [quakenet]
+
+  minio:
+    image: minio/minio:latest
+    container_name: quake-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [quakenet]
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: quake-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+    entrypoint: >
+      /bin/sh -c "
+        set -e;
+        mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+        mc mb --ignore-existing local/$$MINIO_BUCKET;
+        mc anonymous set download local/$$MINIO_BUCKET || true;
+        mc version enable local/$$MINIO_BUCKET || true;
+        echo '[minio-init] bucket ready: '$$MINIO_BUCKET;
+      "
+    restart: "no"
+    networks: [quakenet]
+
+  nifi:
+    build:
+      context: .
+      dockerfile: docker/nifi/Dockerfile
+    container_name: quake-nifi
+    restart: unless-stopped
+    environment:
+      NIFI_WEB_HTTP_PORT: ${NIFI_WEB_HTTP_PORT}
+      NIFI_WEB_HTTP_HOST: 0.0.0.0
+      NIFI_WEB_HTTPS_PORT: ""
+      NIFI_WEB_PROXY_HOST: localhost:${NIFI_WEB_HTTP_PORT}
+      SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_SINGLE_USER_CREDENTIALS_USERNAME}
+      SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_SINGLE_USER_CREDENTIALS_PASSWORD}
+      NIFI_JVM_HEAP_INIT: 512m
+      NIFI_JVM_HEAP_MAX: 1g
+      # Project-specific: install_flow.sh reads these to template the flow.
+      QUAKE_PG_HOST: postgres
+      QUAKE_PG_PORT: "5432"
+      QUAKE_PG_USER: ${POSTGRES_USER}
+      QUAKE_PG_PASSWORD: ${POSTGRES_PASSWORD}
+      QUAKE_PG_DB: ${POSTGRES_DB}
+      QUAKE_MINIO_ENDPOINT: http://minio:9000
+      QUAKE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      QUAKE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      QUAKE_MINIO_BUCKET: ${MINIO_BUCKET}
+      QUAKE_USER_AGENT: ${USER_AGENT}
+    ports:
+      - "${NIFI_WEB_HTTP_PORT}:${NIFI_WEB_HTTP_PORT}"
+    volumes:
+      - ./nifi/flows:/opt/quakeflow/flows:ro
+      - ./nifi/scripts:/opt/quakeflow/scripts:ro
+      - nifi_state:/opt/nifi/nifi-current/state
+      - nifi_db:/opt/nifi/nifi-current/database_repository
+      - nifi_flow:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_content:/opt/nifi/nifi-current/content_repository
+      - nifi_prov:/opt/nifi/nifi-current/provenance_repository
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks: [quakenet]
+
+  postgres-airflow:
+    image: postgres:16-alpine
+    container_name: quake-pg-airflow
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AIRFLOW_PG_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_PG_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_PG_DB}
+    volumes:
+      - pg_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_PG_USER} -d ${AIRFLOW_PG_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [quakenet]
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: quake-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --role Admin \
+          --username "${AIRFLOW_ADMIN_USER}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --email admin@itu.edu.tr \
+          --firstname admin --lastname user || true
+        echo "[airflow-init] done."
+    restart: "no"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: quake-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      postgres-airflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$$(hostname)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: quake-airflow-web
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "${AIRFLOW_WEB_PORT}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-scheduler:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  #for tha backfill mode
+  # Run with:   docker compose --profile backfill up --build backfill
+  # Two modes via BACKFILL_MODE env: historical | replay
+  backfill:
+    build:
+      context: .
+      dockerfile: docker/backfill/Dockerfile
+    container_name: quake-backfill
+    profiles: ["backfill"]
+    environment:
+      MODE: ${BACKFILL_MODE}
+      DAYS: ${BACKFILL_DAYS}
+      MIN_MAG: ${BACKFILL_MIN_MAG}
+      SOURCES: ${BACKFILL_SOURCES}
+      USER_AGENT: ${USER_AGENT}
+      QUAKE_PG_HOST: postgres
+      QUAKE_PG_PORT: "5432"
+      QUAKE_PG_USER: ${POSTGRES_USER}
+      QUAKE_PG_PASSWORD: ${POSTGRES_PASSWORD}
+      QUAKE_PG_DB: ${POSTGRES_DB}
+      QUAKE_MINIO_ENDPOINT: http://minio:9000
+      QUAKE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      QUAKE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      QUAKE_MINIO_BUCKET: ${MINIO_BUCKET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: "no"
+    networks: [quakenet]
+
+  #tests
+  # u can rrun with:   docker compose --profile tests up --build tests
+  tests:
+    build:
+      context: .
+      dockerfile: docker/tests/Dockerfile
+    container_name: quake-tests
+    profiles: ["tests"]
+    environment:
+      QUAKE_PG_HOST: postgres
+      QUAKE_PG_PORT: "5432"
+      QUAKE_PG_USER: ${POSTGRES_USER}
+      QUAKE_PG_PASSWORD: ${POSTGRES_PASSWORD}
+      QUAKE_PG_DB: ${POSTGRES_DB}
+      QUAKE_ES_URL: http://elasticsearch:9200
+      QUAKE_MINIO_ENDPOINT: http://minio:9000
+      QUAKE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      QUAKE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      QUAKE_MINIO_BUCKET: ${MINIO_BUCKET}
+    restart: "no"
+    networks: [quakenet]
+
+#volumes
+volumes:
+  pg_data:
+  pg_airflow_data:
+  pgadmin_data:
+  es_data:
+  minio_data:
+  airflow_logs:
+  nifi_state:
+  nifi_db:
+  nifi_flow:
+  nifi_content:
+  nifi_prov:
+
+#networks
+networks:
+  quakenet:
+    name: quakenet
+    driver: bridge
