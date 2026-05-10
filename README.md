@@ -320,7 +320,7 @@ docker compose exec postgres psql -U quake -d quakes \
 |----------------------|---------------------------------------------------------------|
 | Idempotent ingestion | NiFi PutSQL: `ON CONFLICT (event_id) DO NOTHING`. Python `live_ingest` / backfill: `ON CONFLICT DO UPDATE SET archive_uri = COALESCE(<existing>, EXCLUDED.archive_uri)` so dual writers reconcile the audit handle without overwriting it. UPSERT on harmonized and mart. |
 | Idempotent dedup     | `event_uid` is a deterministic hash of the cluster centroid   |
-| Retries              | NiFi penalize+retry; Airflow `retries=2..3, retry_delay=30s`  |
+| Retries              | Airflow `retries=2..3, retry_delay=30s`  |
 | Failure isolation    | Each DAG task is a separate process; one task failing doesn't block siblings |
 | Replay               | Every raw response archived immutably in MinIO; `BACKFILL_MODE=replay` re-parses without API calls |
 | Defence in depth     | NiFi (`PutSQL`, 60 s) and Airflow `live_ingest` (`psycopg`, 5 min) both write into the same `raw.*` tables for AFAD/EMSC/USGS. NiFi inserts with a NULL `archive_uri` (it can't write to MinIO); `live_ingest` writes the MinIO object first and then upserts with the URI, which backfills any pre-existing NiFi NULL via `COALESCE`. Either writer alone keeps the JSON tables fresh; KOERI is `live_ingest`-only because its HTML response is best parsed in Python. |
