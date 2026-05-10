@@ -54,10 +54,22 @@ _RAW_TABLES = {
 
 def upsert_raw(source: str, records: Iterable[Mapping[str, Any]],
                archive_uri: str | None = None) -> int:
-    """Insert (or no-op on conflict) records into the per-source raw table.
+    """Insert raw events; on conflict, backfill `archive_uri` if it was NULL.
 
-    Each record must be {'event_id': str, 'payload': dict}. Returns the
-    number of rows attempted (insert + skipped duplicates both count).
+    Both NiFi's PutSQL chain and the Airflow `live_ingest` DAG / backfill
+    container write into the same `raw.*_events` tables. NiFi has no MinIO
+    handle, so its rows land with `archive_uri = NULL`. The two writers
+    can race in either order; the COALESCE-based ON CONFLICT clause below
+    keeps the data consistent regardless of order:
+
+      * If the row does not exist: plain INSERT.
+      * If the row exists and already has an `archive_uri`: leave it alone.
+      * If the row exists with `archive_uri = NULL` and the new write
+        provides one: update only that column (payload and `received_at`
+        are kept as the original "first-seen" record).
+
+    Returns the number of rows attempted (insert + ignored conflicts both
+    count).
     """
     table = _RAW_TABLES[source]
     rows = list(records)
@@ -66,7 +78,8 @@ def upsert_raw(source: str, records: Iterable[Mapping[str, Any]],
     sql = f"""
         INSERT INTO {table} (event_id, payload, received_at, archive_uri)
         VALUES (%s, %s, NOW(), %s)
-        ON CONFLICT (event_id) DO NOTHING;
+        ON CONFLICT (event_id) DO UPDATE SET
+            archive_uri = COALESCE({table}.archive_uri, EXCLUDED.archive_uri);
     """
     params = [
         (r["event_id"], Json(r["payload"]), archive_uri) for r in rows

@@ -37,14 +37,18 @@ docker compose up --build
 Within ~5 minutes of `git clone`, an evaluator's machine has:
 
 * live ingestion of all four sources via Apache **NiFi** (60–300 s
-  cadence, source-dependent) — visible on the canvas,
+  cadence, source-dependent) — visible on the canvas. AFAD, EMSC and
+  USGS chains write directly into `raw.*_events` through `PutSQL` /
+  a Postgres `DBCPConnectionPool` controller service that the install
+  script creates and enables via REST,
+* a **defence-in-depth** Airflow `live_ingest` DAG that runs every
+  5 minutes, archives raw responses to MinIO via `boto3`, and writes
+  to the same `raw.*_events` tables with `ON CONFLICT DO NOTHING`,
+  so either NiFi or Airflow alone keeps the tables fresh,
 * every raw response archived immutably in **MinIO** so it can be
   replayed without re-hitting the agency,
 * `harmonize → dedupe → sync_es` Airflow DAG chain materializing the
   deduplicated fact table and pushing updated rows to Elasticsearch,
-* a **defence-in-depth** Airflow `live_ingest` DAG that runs every
-  5 minutes and writes to the same tables (so either NiFi or Airflow
-  alone is sufficient),
 * a Kibana dashboard with a geographic map at <http://localhost:5601>.
 
 If you also run the one-shot **historical backfill profile**, you'll have
@@ -171,12 +175,24 @@ docker compose down -v         # also removes volumes (clean reset)
 
 ## 4. End-to-end data flow example
 
-1. **NiFi** polls all four sources every 60–300 s (visible on the
-   canvas) and flows each response through a parsing chain.
-2. **Airflow `live_ingest`** DAG runs every 5 minutes as a
-   defence-in-depth backup to NiFi: it pulls a short window from each
-   source, archives the raw bytes to MinIO via `boto3`, and upserts
-   into `raw.*` with `ON CONFLICT (event_id) DO NOTHING`.
+1. **NiFi** polls all four sources every 60–300 s on its canvas. The
+   AFAD / EMSC / USGS chains run
+   `InvokeHTTP` → `SplitJson` → `EvaluateJsonPath` →
+   `ReplaceText (Prepend)` → `ReplaceText (Append)` → `PutSQL`,
+   writing one row per event into `raw.<source>_events` through a
+   shared `DBCPConnectionPool` controller service that the install
+   script provisions over REST. The KOERI chain stops at
+   `LogAttribute` because its HTML response is parsed in Python by
+   the `live_ingest` DAG (NiFi-side HTML parsing would require
+   fragile per-line regexes for no real gain).
+2. **Airflow `live_ingest`** DAG runs every 5 minutes and is the
+   sole writer to the immutable **MinIO** archive (via `boto3`,
+   because NiFi 1.x's `PutS3Object` has a known incompatibility
+   with MinIO that path-style addressing does not fix). It also
+   upserts each fetched response into `raw.*` with
+   `ON CONFLICT (event_id) DO NOTHING`, so it works as a
+   defence-in-depth backup to NiFi for the JSON sources and as the
+   sole writer for KOERI.
 3. **Airflow `harmonize`** DAG reads new raw rows (per-source watermark
    on `received_at`) and projects them into `harmonized.events` using
    `src/common/mapping.py`.
@@ -303,7 +319,7 @@ docker compose exec postgres psql -U quake -d quakes \
 | Retries              | NiFi penalize+retry; Airflow `retries=2..3, retry_delay=30s`  |
 | Failure isolation    | Each DAG task is a separate process; one task failing doesn't block siblings |
 | Replay               | Every raw response archived immutably in MinIO; `BACKFILL_MODE=replay` re-parses without API calls |
-| Defence in depth     | NiFi (60 s cadence, visible flow) + Airflow `live_ingest` (5 min, boto3 MinIO writer) target the same `raw.*` tables; either alone is sufficient |
+| Defence in depth     | NiFi (`PutSQL`, 60 s) and Airflow `live_ingest` (`psycopg`, 5 min) both write into the same `raw.*` tables for AFAD/EMSC/USGS with `ON CONFLICT DO NOTHING`; either alone keeps the JSON tables fresh. KOERI is `live_ingest`-only because its HTML response is best parsed in Python. MinIO writes are exclusively done by `live_ingest` and the backfill container via `boto3`. |
 | Data quality         | `quality_check_dag` asserts source freshness, harmonized integrity, agreement-level histogram |
 | Observability        | Airflow UI per-task logs, structured Python logging, pgAdmin / MinIO consoles, Kibana dashboard |
 | Secrets              | `.env` (gitignored), every credential interpolated, none hardcoded |
@@ -326,8 +342,9 @@ docker compose exec postgres psql -U quake -d quakes \
   a long-standing "invalid header name" incompatibility with MinIO
   that path-style addressing alone does not fix. The MinIO archive is
   therefore written by the Airflow `live_ingest` DAG and the backfill
-  container using `boto3`, which speaks MinIO cleanly. NiFi handles
-  the visible polling and parsing.
+  container using `boto3`, which speaks MinIO cleanly. NiFi still
+  handles the durable Postgres writes for the JSON sources via
+  `PutSQL` against a `DBCPConnectionPool` controller service.
 * **Single-node Elasticsearch.** Security disabled; appropriate for a
   local academic deployment, not production.
 * **Threshold tuning.** The dedup window `(Δt ≤ 90 s,
@@ -343,7 +360,7 @@ docker compose exec postgres psql -U quake -d quakes \
 ## 10. AI usage
 
 This project was developed with AI assistance (Cursor IDE + Anthropic
-Claude in the Opus 4.x / Sonnet 4.x families). The complete declaration is again in our
+Claude in the Opus 4.x / Sonnet 4.x families. The complete declaration is again in our
 technical report.
 
 ---

@@ -30,7 +30,7 @@ def _archive(source: str, blob: bytes, ext: str) -> str:
 
 def t_pull_afad() -> int:
     end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=20)
+    start = end - timedelta(minutes=60)
     res = sources.fetch_afad(start, end, min_mag=1.0)
     uri = _archive("AFAD", res.raw_bytes, res.raw_ext)
     n = db.upsert_raw("AFAD", res.records, archive_uri=uri)

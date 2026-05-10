@@ -219,6 +219,12 @@ services:
       SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_SINGLE_USER_CREDENTIALS_PASSWORD}
       NIFI_JVM_HEAP_INIT: 512m
       NIFI_JVM_HEAP_MAX: 1g
+      # Sensitive-property encryption key. Required for the install_flow
+      # script to set the Postgres password on the DBCPConnectionPool
+      # controller service via REST. NiFi 1.x auto-generates one if the
+      # var is empty, but we pin it so the encrypted nifi.properties
+      # stays stable across container restarts and `down -v` cycles.
+      NIFI_SENSITIVE_PROPS_KEY: ${NIFI_SENSITIVE_PROPS_KEY}
       # Project-specific: install_flow.sh reads these to template the flow.
       QUAKE_PG_HOST: postgres
       QUAKE_PG_PORT: "5432"
