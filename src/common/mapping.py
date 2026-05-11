@@ -39,7 +39,7 @@ def _afad_time(value: str) -> str | None:
         return None
     if dt.tzinfo is None:
         from datetime import timedelta
-        dt = dt.replace(tzinfo=timezone(timedelta(hours=3)))
+        dt = dt.replace(tzinfo=timezone(timedelta(hours=0))) #informed assisnants and instructor about this commit via email, the bug occured since afad shows utc+3 on website but on api it returns utc. fixed before demo. 
     return dt.astimezone(timezone.utc).isoformat()
 
 
